@@ -1,15 +1,15 @@
 # Setting this allows creating a symlink to Justfile from another dir
-set working-directory := "/home/tms/code/pd_examples/"
+set working-directory := "/home/weaton/pd_examples/"
 
 # Needed for the proxy server
-vllm-directory := "/home/tms/vllm/" 
+vllm-directory := "/home/weaton/vllm/" 
 
-MODEL := "meta-llama/Llama-3.1-8B-Instruct"
+# MODEL := "meta-llama/Llama-3.1-8B-Instruct"
 TP_SIZE := "1"
 PREFILL_GPUS := "0"
-DECODE_GPUS := "1"
+DECODE_GPUS := "5,6"
 
-# MODEL := "deepseek-ai/DeepSeek-V2-Lite"
+MODEL := "deepseek-ai/DeepSeek-V2-Lite"
 # TP_SIZE := "2"
 # PREFILL_GPUS := "3,4"
 # DECODE_GPUS := "5,6"
@@ -74,7 +74,7 @@ proxy:
 
 
 send_request:
-  curl -X POST http://localhost:$(just port 8192)/v1/completions \
+  curl -X POST http://localhost:$(just port 8200)/v1/completions \
     -H "Content-Type: application/json" \
     -d '{ \
       "model": "{{MODEL}}", \
@@ -104,3 +104,21 @@ eval:
   lm_eval --model local-completions --tasks gsm8k \
     --model_args model={{MODEL}},base_url=http://127.0.0.1:$(just port 8192)/v1/completions,num_concurrent=5,max_retries=3,tokenized_requests=False \
     --limit 100
+
+dp:
+  VLLM_SERVER_DEV_MODE=1 \
+  VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5558) \
+  UCX_LOG_LEVEL=info \
+  VLLM_LOGGING_LEVEL="DEBUG" \
+  VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+  python dp.py \
+          --model="{{MODEL}}" \
+          --master-port $(just port 8300) \
+          --dp-size=2 \
+          --tp-size=1 \
+          --trust-remote-code \
+          --enforce-eager \
+          --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+
+
