@@ -5,7 +5,7 @@ set working-directory := "/home/weaton/pd_examples/"
 vllm-directory := "/home/weaton/vllm/" 
 
 # MODEL := "meta-llama/Llama-1.1-8B-Instruct"
-TP_SIZE := "1"
+TP_SIZE := "2"
 DP_SIZE := "1"
 
 export UCX_TLS := "^dc"
@@ -15,17 +15,19 @@ export UCX_TLS := "^dc"
 # DECODE_GPUS := "4"
 #
 export VLLM_SERVER_DEV_MODE := "1"
+export VLLM_ATTENTION_BACKEND := "FLASH_ATTN"
+export VLLM_NIXL_HANDSHAKE_METHOD := "zmq"
 
 # MODEL := "deepseek-ai/DeepSeek-V2-Lite"
 MODEL := "Qwen/Qwen3-0.6B"
 # TP_SIZE := "2"
-PREFILL_GPUS := "2"
-DECODE_GPUS := "3"
+PREFILL_GPUS := "4"
+DECODE_GPUS := "5,6"
 
 MEMORY_UTIL := "0.3"
 
 port PORT: 
-  @python port_allocator.py {{PORT}}
+  @python3 port_allocator.py {{PORT}}
 
 # For comparing against baseline vLLM
 vanilla_serve:
@@ -42,22 +44,26 @@ vanilla_serve:
       --trust-remote-code
 
 prefill:
+    @truncate -s 0 {{vllm-directory}}/prefill.log
     VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5777) \
     UCX_LOG_LEVEL=warn \
     CUDA_VISIBLE_DEVICES={{PREFILL_GPUS}} \
     VLLM_LOGGING_LEVEL="DEBUG" \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    VLLM_LOGGING_CONFIG_PATH=./vllm_prefill_debug.log \
     vllm serve {{MODEL}} \
       --port $(just port 8100) \
-      --tensor-parallel-size {{TP_SIZE}} \
-      --data-parallel-size {{DP_SIZE}} \
+      --tensor-parallel-size 1 \
+      --data-parallel-size 1 \
       --gpu-memory-utilization {{MEMORY_UTIL}} \
+      --enforce-eager \
       --trust-remote-code \
       --max-model-len 2048 \
       --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
 
 decode:
+    @truncate -s 0 {{vllm-directory}}/decode.log
     VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5778) \
     CUDA_VISIBLE_DEVICES={{DECODE_GPUS}} \
     UCX_LOG_LEVEL=debug \
@@ -66,8 +72,10 @@ decode:
     VLLM_LOGGING_LEVEL="DEBUG" \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    VLLM_LOGGING_CONFIG_PATH=./vllm_decode_debug.log \
     vllm serve {{MODEL}} \
       --port $(just port 8200) \
+      --enforce-eager \
       --tensor-parallel-size {{TP_SIZE}} \
       --data-parallel-size {{DP_SIZE}} \
       --gpu-memory-utilization {{MEMORY_UTIL}} \
@@ -75,9 +83,85 @@ decode:
       --max-model-len 2048 \
       --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
 
+prefill_podman:
+    podman run --rm -it \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --network host \
+      --device nvidia.com/gpu={{PREFILL_GPUS}} \
+      -e HF_TOKEN \
+      -e VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5777) \
+      -e UCX_LOG_LEVEL=debug \
+      -e VLLM_LOGGING_LEVEL="DEBUG" \
+      -e HF_HUB_OFFLINE="" \
+      -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+      -e VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+      -v /dev/infiniband:/dev/infiniband \
+      quay.io/vllm/automation-vllm:llm-d-latest \
+        --model={{MODEL}} \
+        --port $(just port 8100) \
+        --tensor-parallel-size 1 \
+        --data-parallel-size 1 \
+        --gpu-memory-utilization {{MEMORY_UTIL}} \
+        --enforce-eager \
+        --trust-remote-code \
+        --max-model-len 2048 \
+        --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+
+smoke:
+    podman run --rm -it \
+      --cap-add=ALL --network host \
+      --user root \
+      --device nvidia.com/gpu={{PREFILL_GPUS}} \
+      -e HF_TOKEN=$HF_TOKEN \
+      -e HF_HUB_OFFLINE="" \
+      -e UCX_LOG_LEVEL=debug \
+      -e VLLM_LOGGING_LEVEL="DEBUG" \
+      -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+      -e VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+      -v /proving-grounds/:/proving-grounds/ \
+      registry.gitlab.com/redhat/rhel-ai/rhaiis/containers/rhaiis-cuda-ubi9-x86_64:ci_69 \
+        --model='meta-llama/Meta-Llama-3-8B-Instruct' \
+        --port $(just port 8100) \
+        --tensor-parallel-size 1 \
+        --data-parallel-size 1 \
+        --gpu-memory-utilization 0.9 \
+        --enforce-eager \
+        --trust-remote-code \
+        --max-model-len 2048
+
+decode_podman:
+    podman run --rm -it \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=6 \
+      -e HF_TOKEN \
+      -e VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5778) \
+      -e UCX_LOG_LEVEL=debug \
+      -e NCCL_DEBUG=INFO \
+      -e HF_HUB_OFFLINE="" \
+      -e NIXL_LOG_LEVEL=DEBUG \
+      -e VLLM_LOGGING_LEVEL="DEBUG" \
+      -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+      -e VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+      -v /dev/infiniband:/dev/infiniband \
+      quay.io/vllm/automation-vllm:llm-d-latest \
+        --model={{MODEL}} \
+        --port $(just port 8200) \
+        --enforce-eager \
+        --tensor-parallel-size 1 \
+        --data-parallel-size 1 \
+        --gpu-memory-utilization {{MEMORY_UTIL}} \
+        --trust-remote-code \
+        --max-model-len 2048 \
+        --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}"
+
 proxy:
     VLLM_SERVER_DEV_MODE=1 \
-    python "{{vllm-directory}}tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
+    python3 "{{vllm-directory}}tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
       --port $(just port 8192) \
       --prefiller-port $(just port 8100) \
       --decoder-port $(just port 8200)
@@ -94,10 +178,10 @@ send_request:
     }'
 
 send_request_direct:
-  curl -X POST http://localhost:$(just port 8200)/v1/completions \
+  curl -X POST http://localhost:$(just port 8100)/v1/completions \
     -H "Content-Type: application/json" \
     -d '{ \
-      "model": "{{MODEL}}", \
+      "model": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8", \
       "prompt": "Red Hat is the best open source company by far across Linux, K8s, and AI, and vLLM has the greatest community in open source AI software infrastructure. Prefill-decode disaggregation will enable vLLM to ", \
       "max_tokens": 150, \
       "temperature": 0.7 \
@@ -105,6 +189,25 @@ send_request_direct:
 
 benchmark:
   python {{vllm-directory}}/benchmarks/benchmark_serving.py --port $(just port 8192) --model {{MODEL}} --dataset-name random --random-input-len 1000 --random-output-len 100
+
+
+guide_smoke: 
+  guidellm benchmark --target http://localhost:$(just port 8100) --model RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 --output-path output_llama3.json --data prompt_tokens=512,prompt_tokens_stdev=128,prompt_tokens_min=1,prompt_tokens_max=1024,output_tokens=256,output_tokens_stdev=64,output_tokens_min=1,output_tokens_max=1024 --rate-type sweep --max-seconds 400 --warmup-percent 0.2
+
+lm_eval_smoke:
+  HF_TOKEN=$HF_TOKEN llm-eval-test run \
+    --endpoint http://localhost:$(just port 8100)/v1/completions \
+    --model meta-llama/Meta-Llama-3-8B-Instruct  \
+    --tokenizer meta-llama/Meta-Llama-3-8B-Instruct \
+    --datasets ./datasets \
+    --tasks gsm8k_cot \
+    --output gsm8k_results.json
+
+lm_eval_smoke2:
+  python -m lm_eval --model local-completions --model_args model=meta-llama/Meta-Llama-3-8B-Instruct,base_url=http://localhost:$(just port 8100)/v1/completions,max_length=4096 --tasks gsm8k_cot --num_fewshot 8 
+lm_eval_smoke3:
+  python -m lm_eval --model local-completions --model_args model=meta-llama/Meta-Llama-3-8B-Instruct,base_url=http://localhost:$(just port 8100)/v1/completions,max_length=4096 --tasks winogrande --num_fewshot 5 --batch_size auto 
+
 
 benchmark_one_concurrent:
   python {{vllm-directory}}/benchmarks/benchmark_one_concurrent_req.py \
@@ -163,3 +266,6 @@ clean_vllm:
 
 clear_gpu:
    nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_memory --format=csv,noheader | rg $(whoami) | awk '{print $1}' | sed 's/,*$//g' | xargs kill -9
+
+run_dev_servers:
+  ./run_dev_servers.sh
