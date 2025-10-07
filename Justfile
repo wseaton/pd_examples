@@ -1,8 +1,11 @@
 # Setting this allows creating a symlink to Justfile from another dir
-set working-directory := "/home/weaton/pd_examples/"
+set working-directory := "/home/wseaton/pd_examples/"
 
 # Needed for the proxy server
-vllm-directory := "/home/weaton/vllm/"
+vllm-directory := "/home/wseaton/vllm/"
+
+# Default container image for podman recipes
+CONTAINER_IMAGE := "localhost/test:latest"
 
 # MODEL := "meta-llama/Llama-1.1-8B-Instruct"
 TP_SIZE := "1"
@@ -11,21 +14,23 @@ DP_SIZE := "1"
 # export UCX_TLS := "^dc"
 # export CUDA_DEVICE_ORDER := "PCI_BUS_ID"
 # export UCX_TLS := "tcp"
-# PREFILL_GPUS := "1"
 # DECODE_GPUS := "4"
 #
 export VLLM_SERVER_DEV_MODE := "1"
 export VLLM_ATTENTION_BACKEND := "FLASH_ATTN"
-export VLLM_NIXL_HANDSHAKE_METHOD := "http"
+export VLLM_NIXL_HANDSHAKE_METHOD := "zmq"
+export VLLM_USE_V1 := "1"
+export UCX_FAULT_DEBUG := "1"
+
 
 # MODEL := "deepseek-ai/DeepSeek-V2-Lite"
-MODEL := "Qwen/Qwen3-0.6B"
-# MODEL := "RedHatAI/Llama-3.1-8B-Instruct"
+# MODEL := "RedHatAI/Mistral-Large-Instruct-2407-FP8"
+MODEL := "RedHatAI/Llama-3.1-8B-Instruct"
 # TP_SIZE := "2"
 PREFILL_GPUS := "2"
-DECODE_GPUS := "3,4"
+DECODE_GPUS := "3"
 
-MEMORY_UTIL := "0.3"
+# MEMORY_UTIL := "0.3"
 
 # SSL certificate paths
 SSL_CERT_DIR := "/home/weaton/pd_examples/certs"
@@ -75,12 +80,11 @@ vanilla_serve:
       --disable-log-requests \
       --tensor-parallel-size {{TP_SIZE}} \
       --data-parallel-size {{DP_SIZE}} \
-      --gpu-memory-utilization {{MEMORY_UTIL}} \
       --trust-remote-code
 
 prefill:
-    @just generate_ssl_certs
-    @truncate -s 0 {{vllm-directory}}/prefill.log
+    HF_HOME=/home/wseaton/.cache/hf \
+    HF_HUB_CACHE=/home/wseaton/.cache/hf \
     VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5777) \
     UCX_LOG_LEVEL=warn \
     CUDA_VISIBLE_DEVICES={{PREFILL_GPUS}} \
@@ -91,18 +95,15 @@ prefill:
       --port $(just port 8100) \
       --tensor-parallel-size 1 \
       --data-parallel-size 1 \
-      --gpu-memory-utilization {{MEMORY_UTIL}} \
       --enforce-eager \
       --trust-remote-code \
       --max-model-len 2048 \
-      --ssl-keyfile {{SSL_KEY_FILE}} \
-      --ssl-certfile {{SSL_CERT_FILE}} \
-      --ssl-ca-certs {{SSL_CA_CERT}} \
-      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_retry_policy":"abort"}'
 
 decode:
-    @just generate_ssl_certs
-    @truncate -s 0 {{vllm-directory}}/decode.log
+    @rm -f /home/wseaton/pd_examples/decode.log
+    HF_HOME=/home/wseaton/.cache/hf \
+    HF_HUB_CACHE=/home/wseaton/.cache/hf \
     VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5778) \
     CUDA_VISIBLE_DEVICES={{DECODE_GPUS}} \
     UCX_LOG_LEVEL=debug \
@@ -111,47 +112,76 @@ decode:
     VLLM_LOGGING_LEVEL="DEBUG" \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-    VLLM_LOGGING_CONFIG_PATH=./vllm_decode_debug.log \
     vllm serve {{MODEL}} \
       --port $(just port 8200) \
       --enforce-eager \
       --tensor-parallel-size {{TP_SIZE}} \
       --data-parallel-size {{DP_SIZE}} \
-      --gpu-memory-utilization {{MEMORY_UTIL}} \
       --trust-remote-code \
       --max-model-len 2048 \
-      --ssl-keyfile {{SSL_KEY_FILE}} \
-      --ssl-certfile {{SSL_CERT_FILE}} \
-      --ssl-ca-certs {{SSL_CA_CERT}} \
-      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_retry_policy":"abort"}' \
+      2>&1 | tee /home/wseaton/pd_examples/decode.log
 
-prefill_podman:
+decode_with_faults:
+    @rm -f /home/wseaton/pd_examples/decode.log
+    HF_HOME=/home/wseaton/.cache/hf \
+    HF_HUB_CACHE=/home/wseaton/.cache/hf \
+    VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5778) \
+    CUDA_VISIBLE_DEVICES={{DECODE_GPUS}} \
+    UCX_LOG_LEVEL=debug \
+    UCX_FAULT_DEBUG=1 \
+    NCCL_DEBUG=INFO \
+    NIXL_LOG_LEVEL=DEBUG \
+    VLLM_LOGGING_LEVEL="DEBUG" \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    UCX_FAULT_DEBUG=1 \
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    RUST_LOG=debug \
+    LD_PRELOAD=/home/wseaton/ucx-fault-injector/target/release/libucx_fault_injector.so \
+    vllm serve {{MODEL}} \
+      --port $(just port 8200) \
+      --enforce-eager \
+      --tensor-parallel-size {{TP_SIZE}} \
+      --data-parallel-size {{DP_SIZE}} \
+      --trust-remote-code \
+      --max-model-len 2048 \
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_retry_policy":"abort"}' \
+      2>&1 | tee /home/wseaton/pd_examples/decode.log
+
+prefill_podman image=CONTAINER_IMAGE:
+    @rm -f /home/wseaton/pd_examples/memray_output/profile.bin
     podman run --rm -it \
+      --privileged \
       --security-opt=label=disable \
       --cap-add=ALL \
       --user root \
       --network host \
-      --device nvidia.com/gpu={{PREFILL_GPUS}} \
+      --device nvidia.com/gpu=all \
+      --shm-size=8g \
+      -v /dev/infiniband:/dev/infiniband \
+      -v /home/wseaton/pd_examples/memray_output:/memray_output \
+      -v /home/wseaton/.cache/hf:/root/.cache/hf:Z \
       -e HF_TOKEN \
+      -e "HF_HOME=/root/.cache/hf" \
+      -e CUDA_VISIBLE_DEVICES={{PREFILL_GPUS}} \
       -e VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5777) \
-      -e UCX_LOG_LEVEL=debug \
+      -e UCX_LOG_LEVEL=warn \
       -e VLLM_LOGGING_LEVEL="DEBUG" \
-      -e HF_HUB_OFFLINE="" \
-      -e VLLM_NO_USAGE_STATS=0 \
-      -e VLLM_USAGE_STATS_SERVER="http://localhost:8080" \
       -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
       -e VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-      -v /dev/infiniband:/dev/infiniband \
-      quay.io/wseaton/vllm:llmd-multistage-6 \
+      -e HF_HUB_OFFLINE="" \
+      --entrypoint="" \
+      {{image}} \
+      python -m vllm.entrypoints.openai.api_server \
         --model={{MODEL}} \
         --port $(just port 8100) \
         --tensor-parallel-size 1 \
         --data-parallel-size 1 \
         --enforce-eager \
-        --gpu-memory-utilization {{MEMORY_UTIL}} \
         --trust-remote-code \
         --max-model-len 2048 \
-        --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+        --disable-log-requests \
+        --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_retry_policy":"abort"}'
 
 smoke:
     podman run --rm -it \
@@ -177,14 +207,21 @@ smoke:
         --trust-remote-code \
         --max-model-len 2048
 
-decode_podman:
+decode_podman image=CONTAINER_IMAGE:
+    @rm -f /home/wseaton/pd_examples/memray_output/decode_profile.bin
     podman run --rm -it \
       --network=host \
       --security-opt=label=disable \
       --cap-add=ALL \
       --user root \
-      --device nvidia.com/gpu=4 \
+      --device nvidia.com/gpu=all \
+      -v /dev/infiniband:/dev/infiniband \
+      --shm-size=8g \
+      -v /home/wseaton/pd_examples/memray_output:/memray_output \
+      -v /home/wseaton/.cache/hf:/root/.cache/hf:Z \
       -e HF_TOKEN \
+      -e "HF_HOME=/root/.cache/hf" \
+      -e CUDA_VISIBLE_DEVICES={{DECODE_GPUS}} \
       -e VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5778) \
       -e UCX_LOG_LEVEL=debug \
       -e NCCL_DEBUG=INFO \
@@ -193,30 +230,29 @@ decode_podman:
       -e VLLM_LOGGING_LEVEL="DEBUG" \
       -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
       -e VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-      -v /dev/infiniband:/dev/infiniband \
-      quay.io/wseaton/vllm:llmd-multistage-6 \
+      --entrypoint="" \
+      {{image}} \
+      python -m vllm.entrypoints.openai.api_server \
         --model={{MODEL}} \
         --port $(just port 8200) \
-        --tensor-parallel-size 1 \
-        --data-parallel-size 1 \
-        --gpu-memory-utilization {{MEMORY_UTIL}} \
         --enforce-eager \
+        --tensor-parallel-size {{TP_SIZE}} \
+        --data-parallel-size {{DP_SIZE}} \
         --trust-remote-code \
         --max-model-len 2048 \
-        --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}"
+        --disable-log-requests \
+        --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_load_retry_policy\":\"abort\"}"
 
 proxy:
     VLLM_SERVER_DEV_MODE=1 \
     python3 "{{vllm-directory}}tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
       --port $(just port 8192) \
       --prefiller-port $(just port 8100) \
-      --decoder-port $(just port 8200) \
-      --enable-ssl \
-      --ssl-ca-certs {{SSL_CA_CERT}}
+      --decoder-port $(just port 8200)
 
 
 send_request:
-  curl -X POST http://localhost:$(just port 8192)/v1/completions \
+  curl -i -X POST http://localhost:$(just port 8192)/v1/completions \
     -H "Content-Type: application/json" \
     -k \
     -d '{ \
@@ -237,7 +273,7 @@ send_request_direct:
     }'
 
 benchmark:
-  python {{vllm-directory}}/benchmarks/benchmark_serving.py --port $(just port 8192) --model {{MODEL}} --dataset-name random --random-input-len 1000 --random-output-len 100
+  HF_HOME=/home/wseaton/.cache/hf HF_HUB_CACHE="" vllm bench serve --port $(just port 8192) --model {{MODEL}} --dataset-name random --random-input-len 10240 --random-output-len 1280 --max-concurrency 8
 
 
 guide_smoke: 
@@ -272,10 +308,18 @@ reset_prefix_cache:
       curl -X POST http://localhost:$(just port 8100)/reset_prefix_cache
   
 
-clear_ports: 
-  lsof -i:$(just port 8200) | awk 'NR > 1 {print $2}' | xargs kill -9 || true
-  lsof -i:$(just port 8100) | awk 'NR > 1 {print $2}' | xargs kill -9 || true 
-  lsof -i:$(just port 8192) | awk 'NR > 1 {print $2}' | xargs kill -9 || true
+clear_ports:
+  #!/bin/bash
+  # Try lsof first, fallback to ss if not available
+  if command -v lsof &> /dev/null; then
+    lsof -i:$(just port 8200) | awk 'NR > 1 {print $2}' | xargs kill -9 2>/dev/null || true
+    lsof -i:$(just port 8100) | awk 'NR > 1 {print $2}' | xargs kill -9 2>/dev/null || true
+    lsof -i:$(just port 8192) | awk 'NR > 1 {print $2}' | xargs kill -9 2>/dev/null || true
+  else
+    ss -lptn 2>/dev/null | grep -E ":$(just port 8200)\s" | grep -oP 'pid=\K[0-9]+' | xargs kill -9 2>/dev/null || true
+    ss -lptn 2>/dev/null | grep -E ":$(just port 8100)\s" | grep -oP 'pid=\K[0-9]+' | xargs kill -9 2>/dev/null || true
+    ss -lptn 2>/dev/null | grep -E ":$(just port 8192)\s" | grep -oP 'pid=\K[0-9]+' | xargs kill -9 2>/dev/null || true
+  fi
 
 
 eval:
@@ -314,7 +358,326 @@ clean_vllm:
 
 
 clear_gpu:
-   nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_memory --format=csv,noheader | rg $(whoami) | awk '{print $1}' | sed 's/,*$//g' | xargs kill -9
+   #!/bin/bash
+   nvidia-smi --query-compute-apps=pid --format=csv,noheader | while read pid; do \
+     if ps -o user= -p "$pid" 2>/dev/null | grep -q "^$(whoami)$"; then \
+       echo "Killing GPU process $pid"; \
+       kill -9 "$pid"; \
+     fi; \
+   done
+
+# Build ucx-fault-injector client if needed
+build_fault_injector:
+    #!/bin/bash
+    if [ ! -f /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client ]; then
+        echo "Building ucx-fault-injector..."
+        cd /home/wseaton/ucx-fault-injector
+        cargo build --release
+    else
+        echo "ucx-fault-client already built"
+    fi
+
+# Show fault injection help and current status
+fault_help:
+    #!/bin/bash
+    echo "UCX Fault Injection Commands (using ZMQ-based control):"
+    echo ""
+    echo "Basic control:"
+    echo "  just toggle_faults          - Toggle fault injection on/off"
+    echo "  just fault_status           - Show current fault injection status"
+    echo "  just reset_faults           - Reset to defaults (disabled)"
+    echo ""
+    echo "Quick presets:"
+    echo "  just set_10_percent_faults  - Enable 10% NETWORK_ERROR faults"
+    echo "  just set_100_percent_faults - Enable 100% TIMEOUT faults"
+    echo ""
+    echo "Manual control:"
+    echo "  just set_scenario_0         - Set to NETWORK_ERROR faults"
+    echo "  just set_scenario_1         - Set to TIMEOUT faults"
+    echo "  just set_scenario_2         - Set to MEMORY_ERROR faults"
+    echo "  just enable_faults 1 50     - Enable scenario 1 at 50% rate"
+    echo ""
+    echo "Current status:"
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client status
+
+# Set fault injection to 100% rate using ZMQ client
+set_100_percent_faults:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client toggle
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client scenario 1
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client probability 100
+    echo "Fault injection set to 100% rate, scenario 1 (TIMEOUT)"
+
+# Set fault injection to 10% rate using ZMQ client
+set_10_percent_faults:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client toggle
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client scenario 0
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client probability 10
+    echo "Fault injection set to 10% rate, scenario 0 (NETWORK_ERROR)"
+
+# Toggle fault injection on/off
+toggle_faults:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client toggle
+    echo "Fault injection toggled"
+
+# Reset fault injection settings
+reset_faults:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client reset
+    echo "Fault injection RESET (disabled)"
+
+# Set specific fault scenarios
+set_scenario_0:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client scenario 0
+    echo "Set fault scenario to 0 (NETWORK_ERROR)"
+
+set_scenario_1:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client scenario 1
+    echo "Set fault scenario to 1 (TIMEOUT)"
+
+set_scenario_2:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client scenario 2
+    echo "Set fault scenario to 2 (MEMORY_ERROR)"
+
+# Show current fault injection status
+fault_status:
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client status
+    echo "Note: Status is broadcast to all fault injector instances"
+
+# Enable faults with specific scenario and probability
+enable_faults scenario="0" probability="10":
+    #!/bin/bash
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client toggle
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client scenario {{scenario}}
+    /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client probability {{probability}}
+    echo "Enabled fault injection: scenario {{scenario}}, probability {{probability}}%"
+
+
+dump_record:
+    echo '{"command": "dump_recording", "export_format": "records", "value": 50}' | /home/wseaton/ucx-fault-injector/target/release/ucx-fault-client 
+
+generate_flamegraph:
+    podman run --rm -it \
+      -v /home/wseaton/pd_examples/memray_output:/memray_output \
+      --user root \
+      --entrypoint=/bin/bash \
+      localhost/test:latest \
+      -c "memray flamegraph /memray_output/profile.bin -o /memray_output/flamegraph.html"
 
 run_dev_servers:
   ./run_dev_servers.sh
+
+nixl_selftest image=CONTAINER_IMAGE:
+    #!/bin/bash
+    echo "Starting NIXL self test between two {{image}} containers..."
+    
+    # Get available port for the test
+    TEST_PORT=$(just port 5555)
+    
+    # Start target container in background
+    echo "Starting target container on port $TEST_PORT..."
+    podman run --rm -d \
+      --name nixl-target \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v /dev/infiniband:/dev/infiniband \
+      -v {{justfile_directory()}}/nixl_test.py:/nixl_test.py:ro \
+      -e UCX_LOG_LEVEL=debug \
+      -e NIXL_LOG_LEVEL=DEBUG \
+      --entrypoint="" \
+      {{image}} \
+      python /nixl_test.py --ip 127.0.0.1 --port $TEST_PORT --mode target --use_cuda true
+    
+    # Wait a moment for target to start
+    sleep 3
+    
+    # Run initiator container and wait for completion
+    echo "Starting initiator container..."
+    podman run --rm \
+      --name nixl-initiator \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v /dev/infiniband:/dev/infiniband \
+      -v {{justfile_directory()}}/nixl_test.py:/nixl_test.py:ro \
+      -e UCX_LOG_LEVEL=debug \
+      -e NIXL_LOG_LEVEL=DEBUG \
+      --entrypoint="" \
+      {{image}} \
+      python /nixl_test.py --ip 127.0.0.1 --port $TEST_PORT --mode initiator --use_cuda true
+    
+    # Clean up target container
+    echo "Cleaning up target container..."
+    podman stop nixl-target || true
+    
+    echo "NIXL self test completed."
+
+deepgemm_selftest image=CONTAINER_IMAGE:
+    #!/bin/bash
+    echo "Starting DeepGEMM self test with {{image}} container..."
+    
+    # Run DeepGEMM tests in container
+    echo "Running DeepGEMM tests..."
+    podman run --rm \
+      --name deepgemm-test \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v {{justfile_directory()}}/deepgemm_test.py:/deepgemm_test.py:ro \
+      -v {{justfile_directory()}}/DeepGEMM:/opt/deepgemm:ro \
+      --entrypoint="" \
+      {{image}} \
+      python /deepgemm_test.py --test all --gpu 0
+    
+    echo "DeepGEMM self test completed."
+
+deepgemm_simple_selftest image=CONTAINER_IMAGE:
+    #!/bin/bash
+    echo "Starting DeepGEMM simple self test with {{image}} container..."
+    
+    # Run simplified DeepGEMM tests in container
+    echo "Running DeepGEMM simple tests..."
+    podman run --rm \
+      --name deepgemm-simple-test \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v {{justfile_directory()}}/deepgemm_simple_test.py:/deepgemm_simple_test.py:ro \
+      --entrypoint="" \
+      {{image}} \
+      python /deepgemm_simple_test.py --gpu 0
+    
+    echo "DeepGEMM simple self test completed."
+
+deepgemm_minimal_selftest image=CONTAINER_IMAGE:
+    #!/bin/bash
+    echo "Starting DeepGEMM minimal self test with {{image}} container..."
+    
+    # Run minimal DeepGEMM availability tests in container
+    echo "Running DeepGEMM minimal tests..."
+    podman run --rm \
+      --name deepgemm-minimal-test \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v {{justfile_directory()}}/deepgemm_minimal_test.py:/deepgemm_minimal_test.py:ro \
+      --entrypoint="" \
+      {{image}} \
+      python /deepgemm_minimal_test.py --gpu 0
+    
+    echo "DeepGEMM minimal self test completed."
+
+pplx_kernels_selftest image=CONTAINER_IMAGE:
+    #!/bin/bash
+    echo "Starting pplx-kernels all-to-all benchmark with {{image}} container..."
+    
+    # Run pplx-kernels all-to-all benchmark in container
+    echo "Running pplx-kernels all-to-all benchmark..."
+    podman run --rm \
+      --name pplx-kernels-test \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v /dev/infiniband:/dev/infiniband \
+      --shm-size=8g \
+      -v {{justfile_directory()}}/pplx-kernels:/opt/pplx-kernels \
+      --entrypoint="" \
+      {{image}} \
+      bash -c "cd /opt/pplx-kernels && pip install pytest && python -m tests.bench_all_to_all --dp-size 1"
+    
+    echo "pplx-kernels all-to-all benchmark completed."
+
+deepep_intranode_test image=CONTAINER_IMAGE:
+    #!/bin/bash
+    echo "Starting DeepEP intranode (single node) test with {{image}} container..."
+    
+    # Run DeepEP intranode test in container
+    echo "Running DeepEP intranode test..."
+    podman run --rm \
+      --name deepep-intranode-test \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v /dev/infiniband:/dev/infiniband \
+      --shm-size=8g \
+      -v {{justfile_directory()}}/DeepEP:/opt/DeepEP \
+      -e MASTER_ADDR=127.0.0.1 \
+      -e MASTER_PORT=29500 \
+      -e WORLD_SIZE=1 \
+      -e RANK=0 \
+      --entrypoint="" \
+      {{image}} \
+      bash -c "cd /opt/DeepEP && python tests/test_intranode.py --num-processes 4 --num-tokens 1024 --hidden 2048 --num-topk 4 --num-experts 64"
+    
+    echo "DeepEP intranode test completed."
+
+deepep_low_latency_test image=CONTAINER_IMAGE:
+    #!/bin/bash
+    echo "Starting DeepEP low latency test with {{image}} container..."
+    
+    # Run DeepEP low latency test in container
+    echo "Running DeepEP low latency test..."
+    podman run --rm \
+      --name deepep-low-latency-test \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=all \
+      -v /dev/infiniband:/dev/infiniband \
+      --shm-size=8g \
+      -v {{justfile_directory()}}/DeepEP:/opt/DeepEP \
+      -e MASTER_ADDR=127.0.0.1 \
+      -e MASTER_PORT=29501 \
+      -e WORLD_SIZE=1 \
+      -e RANK=0 \
+      --entrypoint="" \
+      {{image}} \
+      bash -c "cd /opt/DeepEP && python tests/test_low_latency.py --num-processes 2 --num-tokens 512 --hidden 1024 --num-topk 2 --num-experts 32"
+    
+    echo "DeepEP low latency test completed."
+
+shell:
+    podman run --rm -it \
+      --network=host \
+      --security-opt=label=disable \
+      --cap-add=ALL \
+      --user root \
+      --device nvidia.com/gpu=4 \
+      --entrypoint=/bin/bash \
+      -e HF_TOKEN \
+      -e VLLM_NIXL_SIDE_CHANNEL_PORT=$(just port 5778) \
+      -e UCX_LOG_LEVEL=debug \
+      -e NCCL_DEBUG=INFO \
+      -e HF_HUB_OFFLINE="" \
+      -e NIXL_LOG_LEVEL=DEBUG \
+      -e VLLM_LOGGING_LEVEL="DEBUG" \
+      -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+      -e VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+      localhost/test:latest
+
+zmq_hostname_test:
+    python3 zmq_test_script.py
+
+
